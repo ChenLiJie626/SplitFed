@@ -45,6 +45,8 @@ if torch.cuda.is_available():
     print(torch.cuda.get_device_name(0))    
 
 #===================================================================
+program = "SFL_Clustring on Cifar"
+print(f"---------{program}----------")
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -146,13 +148,213 @@ def split_test_by_train(train_dict, train_dataset, test_dataset, seed=123):
 
         owners = [cid for cid in range(num_clients) if c in client_labels[cid]]
         if not owners:                 # 若极端地没人拥有该类，可全部丢给第 0 个客户端或跳过
-            continue                   # 此处简单跳过
+            continue                   
 
         splits = np.array_split(idxs, len(owners))
         for chunk, cid in zip(splits, owners):
             test_dict[cid].extend(chunk)
 
     return {cid: np.array(idxs) for cid, idxs in test_dict.items()}
+
+def add_entity(S: np.ndarray,
+               client_groups: dict,
+               z_new: torch.Tensor,
+               z_list: list,
+               theta_assign: float):
+    """
+    参数
+    ----
+    S              : 现有相似度矩阵 (N,N)  - NumPy
+    client_groups  : 现有聚类结果  {label: [id, …]}
+    z_new          : 新实体的特征向量 (torch 1-D, 已 L2-norm)
+    z_list         : 现有实体特征向量列表 (长度 N, 每项 torch 1-D)
+    theta_assign   : 相似度阈值 θ_assign
+
+    返回
+    ----
+    S_new, client_groups_new
+    """
+
+    N = S.shape[0]
+    # ---------- 1. 扩展相似度矩阵 ----------
+    S_new = np.zeros((N + 1, N + 1), dtype=S.dtype)
+    S_new[:N, :N] = S
+
+    # ---------- 2. 计算新实体与所有现有实体的余弦相似度 ----------
+    sims = []
+    for zj in z_list:
+        sims.append(torch.dot(z_new, zj).item())  # 已 L2-norm
+    sims = np.array(sims)                         # shape = (N,)
+
+    # 写入对称位置
+    S_new[N, :N] = sims
+    S_new[:N, N] = sims
+    # 自身相似度
+    S_new[N, N] = 1.0
+
+    # ---------- 3. 根据 θ_assign 决定归属 ----------
+    max_sim_idx = int(sims.argmax())
+    max_sim_val = sims[max_sim_idx]
+
+    client_groups_new = {lab: ids.copy() for lab, ids in client_groups.items()}
+
+    if max_sim_val >= theta_assign:
+        # 找到 max_sim_idx 所在簇
+        for lab, ids in client_groups_new.items():
+            if max_sim_idx in ids:
+                ids.append(N)         # 把新节点加进来
+                break
+    else:
+        # 创建新簇，label 取当前最大 label + 1
+        new_label = max(client_groups_new) + 1 if client_groups_new else 0
+        client_groups_new[new_label] = [N]
+
+    # ---------- 4. 返回 ----------
+    return S_new, client_groups_new
+
+def remove_entity(S: np.ndarray,
+                  client_groups: dict,
+                  remove_id: int):
+    """
+    参数
+    ----
+    S             : 当前相似度矩阵 (N,N)
+    client_groups : 当前聚类结果
+    remove_id     : 退出实体在矩阵中的行/列索引
+
+    返回
+    ----
+    S_new, client_groups_new
+    """
+
+    N = S.shape[0]
+    assert 0 <= remove_id < N, "remove_id 超出范围"
+
+    # ---------- 1. 从相似度矩阵删除对应行列 ----------
+    keep = [i for i in range(N) if i != remove_id]
+    S_new = S[np.ix_(keep, keep)]
+
+    # ---------- 2. 更新聚类簇 ----------
+    client_groups_new = {}
+    for lab, ids in client_groups.items():
+        new_ids = [idx if idx < remove_id else idx - 1  # 索引左移
+                   for idx in ids if idx != remove_id]
+        if new_ids:                         # 仅保留非空簇
+            client_groups_new[lab] = new_ids
+
+    return S_new, client_groups_new
+
+
+def _inter_cluster_distance(Ci, Cj, S):
+    sub = S[np.ix_(Ci, Cj)]
+    return np.mean(1.0 - sub)         # 1 - similarity  →  distance
+
+
+def merge_clusters(S, client_groups, theta_merge=0.04):
+    """
+    若满足  D(C_i,C_j) < theta_merge  → 合并产生新簇
+    返回:  (S_new, client_groups_new, merged_flag)
+    """
+    S_new          = copy.deepcopy(S)
+    groups         = copy.deepcopy(client_groups)
+    labels = list(groups.keys())
+    merged_flag = False
+
+    # -------- 扫描所有簇对，找出需合并的集合 --------
+    to_merge = []          # [(lab_i, lab_j), …]
+    for a in range(len(labels)):
+        for b in range(a + 1, len(labels)):
+            li, lj = labels[a], labels[b]
+            dist = _inter_cluster_distance(groups[li], groups[lj], S)
+            if dist < theta_merge:
+                to_merge.append((li, lj))
+
+    if not to_merge:
+        return S_new, groups, merged_flag
+
+    merged_flag = True
+    for li, lj in to_merge:
+        # 1) 新 label
+        new_lab = max(groups) + 1
+        groups[new_lab] = groups[li] + groups[lj]
+        # 2) 移除旧 label
+        groups.pop(li, None)
+        groups.pop(lj, None)
+
+    return S_new, groups, merged_flag
+
+def _wcss(indices, z_list):
+    if len(indices) <= 1:
+        return 0.0
+    zs = torch.stack([z_list[i] for i in indices])          # (k,d)
+    centroid = zs.mean(dim=0)
+    dists = torch.norm(zs - centroid, dim=1)                # L2
+    return float(torch.sum(dists ** 2))
+
+def _split_once(indices, z_list, theta_split, max_iter=20):
+    """
+    对给定 indices 做一次“迭代式元素移除”。
+    返回 (main_cluster, removed_set)
+    """
+    if len(indices) <= 2:
+        return indices, []          # 规模太小不拆
+
+    remain = indices.copy()
+    for _ in range(max_iter):
+        improved = False
+        base_avg = _wcss(remain, z_list) / len(remain)
+
+        for idx in remain[:]:
+            tmp = remain.copy()
+            tmp.remove(idx)
+            if len(tmp) == 0:
+                continue
+            new_avg = _wcss(tmp, z_list) / len(tmp)
+            if new_avg < base_avg:
+                remain.remove(idx)
+                improved = True
+        if not improved:
+            break
+
+    removed = [idx for idx in indices if idx not in remain]
+    return remain, removed
+
+def split_cluster(S, client_groups, z_list,
+                  theta_split=0.10, max_iter=20):
+    """
+    递归细化所有满足  WCSS/|C| > theta_split  的簇
+    —— 对 removed 集合再次套用相同算法，直到无可再拆
+    """
+    groups      = copy.deepcopy(client_groups)
+    split_flag  = False
+    next_label  = max(groups) + 1 if groups else 0
+
+    queue = list(groups.items())          # [(lab,[ids]), …]
+    new_groups = {}
+
+    while queue:
+        lab, members = queue.pop(0)
+
+        # 计算平均 WCSS
+        avg_wcss = _wcss(members, z_list) / len(members)
+        if avg_wcss <= theta_split or len(members) <= 2:
+            new_groups[lab] = members
+            continue
+
+        # 触发拆分
+        split_flag = True
+        main_c, removed = _split_once(members, z_list,
+                                      theta_split, max_iter)
+
+        new_groups[lab] = main_c    # 保留主簇
+
+        if removed:
+            # 将 removed 作为新簇重新进入队列，递归评估
+            new_lab = next_label
+            next_label += 1
+            queue.append((new_lab, removed))
+
+    return S, new_groups, split_flag
 
 #=====================================================================================================
 #                           Client-side Model definition
@@ -164,7 +366,6 @@ class ResNet18_Client(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # conv1：为了 CIFAR-10，改为 3×3 stride=1，保留 32×32 分辨率
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1,
                                padding=1, bias=False)
         self.bn1   = nn.BatchNorm2d(64)
@@ -173,7 +374,6 @@ class ResNet18_Client(nn.Module):
         # ---------------- ResNet layer1 (2 basic blocks) ----------------
         self.layer1 = self._make_layer(64, 64, num_blocks=2, stride=1)
         # ---------------- ResNet layer2 (2 basic blocks) ----------------
-        # 这里 stride=2，把 32×32 → 16×16
         self.layer2 = self._make_layer(64, 128, num_blocks=2, stride=2)
 
         self._weights_init()
@@ -205,7 +405,6 @@ class ResNet18_Client(nn.Module):
     def _make_layer(self, in_planes, planes, num_blocks, stride):
         downsample = None
         if stride != 1 or in_planes != planes:
-            # 通道数或尺寸发生变化时，用 1×1 卷积匹配
             downsample = nn.Sequential(
                 nn.Conv2d(in_planes, planes,
                           kernel_size=1, stride=stride, bias=False),
@@ -312,7 +511,6 @@ net_glob_server = ResNet18_Server().to(device)
 
 # -------------------------------------------------
 # 编码器 Enc：降维/量化
-# 这里示例：3×3 stride=2 卷积 + BN + ReLU -> (B, C/2, H/2, W/2)
 # -------------------------------------------------
 class Encoder(nn.Module):
     """
@@ -380,7 +578,7 @@ def pretrain_autoencoder(client_net, enc, dec, ldr_train,
             loss_sum += loss.item(); cnt += 1
         print(f"[AE-pre] epoch {ep+1}/{epochs}  loss={loss_sum/cnt:.4f}")
 
-    return enc, dec                      # 训练后的参数
+    return enc, dec                     
 
 
 encoder_client = Encoder().to(device)
@@ -440,11 +638,10 @@ net_server = copy.deepcopy(net_model_server[0]).to(device)
 #optimizer_server = torch.optim.Adam(net_server.parameters(), lr = lr)
 
 def flatten_params(model_state_dict):
-    # 将所有的参数展平为一个一维向量
     params = []
     for param in model_state_dict.values():
-        params.append(param.view(-1))  # 展平每个参数张量
-    return torch.cat(params)  # 将所有参数拼接成一个大的张量
+        params.append(param.view(-1)) 
+    return torch.cat(params)  
 
 # Server-side function associated with Training 
 def train_server(z, y, l_epoch_count, l_epoch, idx, len_batch, decoder):
@@ -762,3 +959,8 @@ for iter in range(epochs):
     net_glob_client.load_state_dict(w_glob_client)
 
 print("Training and Evaluation completed!")
+
+round_process = [i for i in range(1, len(acc_train_collect)+1)]
+df = DataFrame({'round': round_process,'acc_train':acc_train_collect, 'acc_test':acc_test_collect})     
+file_name = program+".xlsx"    
+df.to_excel(file_name, sheet_name= "v1_test", index = False)   
